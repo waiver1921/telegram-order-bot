@@ -4,6 +4,7 @@ Telegram Order Bot — Sales Rep Flow (Phase 1)
 Features:
 - Auth by telegram_id (Sales Reps sheet)
 - Client search in Google Sheets
+- New client creation
 - Catalog browsing (category → product → variant → quantity)
 - Price by client's price_group
 - Cart assembly
@@ -51,7 +52,15 @@ logger = logging.getLogger(__name__)
     SELECT_ADDRESS,
     ENTER_ADDRESS,
     CONFIRM_ORDER,
-) = range(12)
+    # New client creation states
+    NEW_CLIENT_NAME,
+    NEW_CLIENT_CONTACT,
+    NEW_CLIENT_PHONE,
+    NEW_CLIENT_EMAIL,
+    NEW_CLIENT_PRICE_GROUP,
+    NEW_CLIENT_ADDRESS,
+    NEW_CLIENT_CONFIRM,
+) = range(19)
 
 # ─── Helpers ──────────────────────────────────────────────────
 
@@ -87,6 +96,16 @@ def order_items_summary(cart: list[dict]) -> str:
     for item in cart:
         parts.append(f"{item['display_name']} x{item['quantity']} @€{item['price']:.2f}")
     return ", ".join(parts)
+
+
+# ─── Global back_main handler ────────────────────────────────
+
+
+async def global_back_main(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Universal handler for back_main from any state."""
+    query = update.callback_query
+    await query.answer()
+    return await _go_main_menu(query, context)
 
 
 # ─── /start ───────────────────────────────────────────────────
@@ -133,6 +152,7 @@ async def main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         context.user_data["address"] = None
         kb = build_kb([
             [("🔍 Поиск клиента", "search_client")],
+            [("➕ Новый клиент", "new_client")],
         ])
         await query.edit_message_text("Для кого заказ?", reply_markup=kb)
         return SEARCH_CLIENT
@@ -160,8 +180,12 @@ async def search_client_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     results = sheets.search_clients(query_text)
 
     if not results:
-        kb = build_kb([[("🔍 Искать снова", "search_client")], [("↩️ Главное меню", "back_main")]])
-        await update.message.reply_text("Ничего не найдено. Попробуйте другой запрос.", reply_markup=kb)
+        kb = build_kb([
+            [("🔍 Искать снова", "search_client")],
+            [("➕ Новый клиент", "new_client")],
+            [("↩️ Главное меню", "back_main")],
+        ])
+        await update.message.reply_text("Ничего не найдено.", reply_markup=kb)
         return SEARCH_CLIENT
 
     # Store results for selection
@@ -172,10 +196,10 @@ async def search_client_input(update: Update, context: ContextTypes.DEFAULT_TYPE
         label = f"{client.get('name', '?')} — {client.get('price_group', '?')}"
         addr = client.get("address_1", "")
         if addr:
-            # show short address
             label += f" — {addr[:30]}"
         buttons.append([(label, f"pick_client_{i}")])
-    buttons.append([("🔍 Искать снова", "search_client"), ("↩️ Меню", "back_main")])
+    buttons.append([("🔍 Искать снова", "search_client"), ("➕ Новый", "new_client")])
+    buttons.append([("↩️ Главное меню", "back_main")])
 
     kb = build_kb(buttons)
     await update.message.reply_text(f"Найдено ({len(results)}):", reply_markup=kb)
@@ -191,8 +215,10 @@ async def pick_client(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         await query.edit_message_text("🔍 Введите имя, телефон или компанию:")
         return SELECT_CLIENT
 
-    if query.data == "back_main":
-        return await _go_main_menu(query, context)
+    if query.data == "new_client":
+        await query.edit_message_text("➕ Введите название компании / имя клиента:")
+        context.user_data["new_client"] = {}
+        return NEW_CLIENT_NAME
 
     idx = int(query.data.replace("pick_client_", ""))
     results = context.user_data.get("search_results", [])
@@ -224,7 +250,7 @@ async def _show_client_card(query, context, client) -> int:
     kb = build_kb([
         [("🆕 Новый заказ", "start_order")],
         [("🔍 Другой клиент", "search_client")],
-        [("↩️ Меню", "back_main")],
+        [("↩️ Главное меню", "back_main")],
     ])
     await query.edit_message_text(text, reply_markup=kb)
     return CLIENT_CARD
@@ -240,10 +266,163 @@ async def client_card_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif query.data == "search_client":
         await query.edit_message_text("🔍 Введите имя, телефон или компанию:")
         return SELECT_CLIENT
-    elif query.data == "back_main":
-        return await _go_main_menu(query, context)
 
     return CLIENT_CARD
+
+
+# ─── New Client Creation ─────────────────────────────────────
+
+
+async def new_client_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Start new client flow — from callback button."""
+    query = update.callback_query
+    await query.answer()
+    context.user_data["new_client"] = {}
+    await query.edit_message_text("➕ Введите название компании / имя клиента:")
+    return NEW_CLIENT_NAME
+
+
+async def new_client_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Got company/client name."""
+    name = update.message.text.strip()
+    context.user_data["new_client"]["name"] = name
+    await update.message.reply_text(f"✅ Компания: {name}\n\nВведите контактное лицо (имя и фамилия):")
+    return NEW_CLIENT_CONTACT
+
+
+async def new_client_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Got contact person."""
+    contact = update.message.text.strip()
+    context.user_data["new_client"]["contact_person"] = contact
+    await update.message.reply_text(f"✅ Контакт: {contact}\n\nВведите телефон:")
+    return NEW_CLIENT_PHONE
+
+
+async def new_client_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Got phone."""
+    phone = update.message.text.strip()
+    context.user_data["new_client"]["phone"] = phone
+    kb = build_kb([[("⏩ Пропустить", "skip_email")]])
+    await update.message.reply_text(f"✅ Телефон: {phone}\n\nВведите email:", reply_markup=kb)
+    return NEW_CLIENT_EMAIL
+
+
+async def new_client_email_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Got email as text."""
+    email = update.message.text.strip()
+    context.user_data["new_client"]["email"] = email
+    kb = build_kb([
+        [("retail", "pg_retail"), ("vip", "pg_vip")],
+        [("b2b_standard", "pg_b2b_standard"), ("b2b_gold", "pg_b2b_gold")],
+    ])
+    await update.message.reply_text("Выберите ценовую группу:", reply_markup=kb)
+    return NEW_CLIENT_PRICE_GROUP
+
+
+async def new_client_email_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Skip email."""
+    query = update.callback_query
+    await query.answer()
+    context.user_data["new_client"]["email"] = ""
+    kb = build_kb([
+        [("retail", "pg_retail"), ("vip", "pg_vip")],
+        [("b2b_standard", "pg_b2b_standard"), ("b2b_gold", "pg_b2b_gold")],
+    ])
+    await query.edit_message_text("Выберите ценовую группу:", reply_markup=kb)
+    return NEW_CLIENT_PRICE_GROUP
+
+
+async def new_client_price_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Got price group."""
+    query = update.callback_query
+    await query.answer()
+    group = query.data.replace("pg_", "")
+    context.user_data["new_client"]["price_group"] = group
+    await query.edit_message_text(
+        f"✅ Группа: {group}\n\nВведите адрес доставки (улица, индекс, город):"
+    )
+    return NEW_CLIENT_ADDRESS
+
+
+async def new_client_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Got address — show confirmation."""
+    address = update.message.text.strip()
+    nc = context.user_data["new_client"]
+    nc["address_1"] = address
+
+    text = (
+        f"📋 Новый клиент:\n\n"
+        f"🏢 {nc.get('name', '—')}\n"
+        f"👤 {nc.get('contact_person', '—')}\n"
+        f"📞 {nc.get('phone', '—')}\n"
+        f"📧 {nc.get('email', '—') or '—'}\n"
+        f"💰 {nc.get('price_group', '—')}\n"
+        f"📍 {address}\n\n"
+        f"Всё верно?"
+    )
+    kb = build_kb([
+        [("✅ Сохранить", "save_client")],
+        [("✏️ Начать заново", "redo_client")],
+        [("❌ Отмена", "back_main")],
+    ])
+    await update.message.reply_text(text, reply_markup=kb)
+    return NEW_CLIENT_CONFIRM
+
+
+async def new_client_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Save or redo new client."""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "back_main":
+        return await _go_main_menu(query, context)
+
+    if query.data == "redo_client":
+        context.user_data["new_client"] = {}
+        await query.edit_message_text("➕ Введите название компании / имя клиента:")
+        return NEW_CLIENT_NAME
+
+    if query.data == "save_client":
+        nc = context.user_data["new_client"]
+        client_id = sheets.get_next_client_id()
+        client_data = {
+            "client_id": client_id,
+            "name": nc.get("name", ""),
+            "contact_person": nc.get("contact_person", ""),
+            "phone": nc.get("phone", ""),
+            "email": nc.get("email", ""),
+            "telegram_id": "",
+            "price_group": nc.get("price_group", "retail"),
+            "address_1": nc.get("address_1", ""),
+            "address_2": "",
+            "address_label_1": "",
+            "address_label_2": "",
+            "notes": "",
+            "shopify_customer_id": "",
+            "usual_order": "",
+            "last_order_date": "",
+        }
+        result = sheets.create_client(client_data)
+        if result:
+            context.user_data["client"] = client_data
+            text = (
+                f"✅ Клиент «{nc.get('name')}» создан! ({client_id})\n\n"
+                f"🏢 {nc.get('name')}\n"
+                f"Группа: {nc.get('price_group')}\n"
+                f"Адрес: {nc.get('address_1')}"
+            )
+            kb = build_kb([
+                [("🆕 Новый заказ", "start_order")],
+                [("🔍 Другой клиент", "search_client")],
+                [("↩️ Главное меню", "back_main")],
+            ])
+            await query.edit_message_text(text, reply_markup=kb)
+            return CLIENT_CARD
+        else:
+            await query.edit_message_text("❌ Ошибка при сохранении. Попробуйте снова.")
+            return await _go_main_menu_msg(query, context)
+
+    return NEW_CLIENT_CONFIRM
 
 
 # ─── Catalog ──────────────────────────────────────────────────
@@ -343,7 +522,6 @@ async def variant_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.answer()
 
     if query.data == "back_products":
-        # Go back to product list
         category = context.user_data.get("current_category", "")
         products = sheets.get_products_by_category(category)
         buttons = [[(p.get("name", "?"), f"prod_{p.get('name')}")] for p in products]
@@ -354,7 +532,6 @@ async def variant_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     product_id = query.data.replace("var_", "")
 
-    # Find the variant in catalog
     catalog = sheets.get_catalog()
     variant = None
     for item in catalog:
@@ -392,7 +569,6 @@ async def quantity_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await query.answer()
 
     if query.data == "back_variants":
-        # Re-show variants
         category = context.user_data.get("current_category", "")
         product_name = context.user_data.get("current_product_name", "")
         variants = sheets.get_variants(category, product_name)
@@ -471,13 +647,13 @@ async def _show_address_selection(query, context) -> int:
     buttons = []
 
     addr1 = client.get("address_1", "")
-    label1 = client.get("address_label_1", "Адрес 1")
+    label1 = client.get("address_label_1", "") or "Адрес 1"
     if addr1:
         short = addr1[:40] if len(addr1) > 40 else addr1
         buttons.append([(f"📍 {label1} — {short}", "addr_1")])
 
     addr2 = client.get("address_2", "")
-    label2 = client.get("address_label_2", "Адрес 2")
+    label2 = client.get("address_label_2", "") or "Адрес 2"
     if addr2:
         short = addr2[:40] if len(addr2) > 40 else addr2
         buttons.append([(f"📍 {label2} — {short}", "addr_2")])
@@ -519,8 +695,6 @@ async def enter_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     address_text = update.message.text.strip()
     context.user_data["address"] = address_text
 
-    # Create a fake query-like object to reuse _show_confirmation
-    # We need to send a new message instead of editing
     cart = context.user_data.get("cart", [])
     client = context.user_data.get("client", {})
     address = context.user_data.get("address", "—")
@@ -597,7 +771,6 @@ async def _create_order(query, context) -> int:
     address_str = context.user_data.get("address", "")
     rep = context.user_data.get("rep", {})
 
-    # Build line items for Shopify
     price_group = client.get("price_group", "retail")
     line_items = []
     for item in cart:
@@ -605,8 +778,6 @@ async def _create_order(query, context) -> int:
             "variant_id": item.get("shopify_variant_id", ""),
             "quantity": item["quantity"],
         }
-        # Calculate discount from retail price if applicable
-        # For simplicity, we pass the custom price as a fixed discount
         catalog = sheets.get_catalog()
         retail_price = None
         for p in catalog:
@@ -622,7 +793,6 @@ async def _create_order(query, context) -> int:
             }
         line_items.append(li)
 
-    # Parse address into Shopify format
     shipping_address = _parse_address(address_str, client)
 
     customer_id = client.get("shopify_customer_id", "")
@@ -639,8 +809,32 @@ async def _create_order(query, context) -> int:
     )
 
     if result.get("error"):
-        await query.edit_message_text(f"❌ Ошибка Shopify: {result['error']}")
-        kb = build_kb([[("🔄 Повторить", "place_order"), ("↩️ Меню", "back_main")]])
+        order_id = sheets.get_next_order_id()
+        order_data = {
+            "order_id": order_id,
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "client_id": client.get("client_id", ""),
+            "client_name": client.get("name", ""),
+            "items": order_items_summary(cart),
+            "total": f"{cart_total(cart):.2f}",
+            "price_group": price_group,
+            "custom_prices": "Нет",
+            "address": address_str,
+            "sales_rep": rep_name,
+            "shopify_draft_id": "",
+            "shopify_invoice_url": "",
+            "status": "error",
+        }
+        sheets.save_order(order_data)
+
+        await query.edit_message_text(
+            f"⚠️ Ошибка Shopify: {result['error']}\n\n"
+            f"Заказ {order_id} сохранён в таблицу со статусом «error»."
+        )
+        kb = build_kb([
+            [("🔄 Повторить", "place_order")],
+            [("↩️ Главное меню", "back_main")],
+        ])
         await query.message.reply_text("Что делаем?", reply_markup=kb)
         return CONFIRM_ORDER
 
@@ -663,13 +857,11 @@ async def _create_order(query, context) -> int:
     }
     sheets.save_order(order_data)
 
-    # Update client
     sheets.update_client_after_order(
         client_id=client.get("client_id", ""),
         order_summary=order_items_summary(cart),
     )
 
-    # Success message
     invoice_url = result.get("invoiceUrl", "")
     shopify_id = result.get("name", "")
     text = (
@@ -681,7 +873,7 @@ async def _create_order(query, context) -> int:
 
     buttons = []
     if invoice_url:
-        buttons.append([("🔗 Ссылка на оплату", f"copy_invoice")])
+        buttons.append([("🔗 Ссылка на оплату", "copy_invoice")])
     buttons.append([("🆕 Новый заказ", "new_order")])
     buttons.append([("↩️ Главное меню", "back_main")])
 
@@ -693,21 +885,18 @@ async def _create_order(query, context) -> int:
 
 def _parse_address(address_str: str, client: dict) -> dict:
     """Best-effort parse address string into Shopify format."""
+    import re
     contact = client.get("contact_person", "")
     parts = contact.split(" ", 1) if contact else ["", ""]
     first = parts[0] if len(parts) > 0 else ""
     last = parts[1] if len(parts) > 1 else ""
 
-    # Try to extract zip code (5-digit German PLZ)
-    import re
     zip_match = re.search(r"\b(\d{5})\b", address_str)
     zip_code = zip_match.group(1) if zip_match else ""
 
-    # Remove zip from address to get street
     street = address_str
-    city = "Berlin"  # Default for this business
+    city = "Berlin"
     if zip_code:
-        # Try to find city name after PLZ
         after_zip = address_str.split(zip_code, 1)
         if len(after_zip) > 1 and after_zip[1].strip():
             city = after_zip[1].strip().strip(",").strip()
@@ -780,49 +969,86 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
+    # back_main handler — added to every state
+    back_main_handler = CallbackQueryHandler(global_back_main, pattern="^back_main$")
+
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
             MAIN_MENU: [
                 CallbackQueryHandler(main_menu_handler, pattern="^(new_order|my_orders)$"),
                 CallbackQueryHandler(invoice_handler, pattern="^copy_invoice$"),
+                back_main_handler,
             ],
             SEARCH_CLIENT: [
                 CallbackQueryHandler(search_client_start, pattern="^search_client$"),
-                CallbackQueryHandler(main_menu_handler, pattern="^back_main$"),
+                CallbackQueryHandler(new_client_start, pattern="^new_client$"),
+                back_main_handler,
                 MessageHandler(filters.TEXT & ~filters.COMMAND, search_client_input),
             ],
             SELECT_CLIENT: [
-                CallbackQueryHandler(pick_client, pattern="^(pick_client_\\d+|search_client|back_main)$"),
+                CallbackQueryHandler(pick_client, pattern="^(pick_client_\\d+|search_client|new_client)$"),
+                back_main_handler,
                 MessageHandler(filters.TEXT & ~filters.COMMAND, search_client_input),
             ],
             CLIENT_CARD: [
-                CallbackQueryHandler(client_card_handler, pattern="^(start_order|search_client|back_main)$"),
+                CallbackQueryHandler(client_card_handler, pattern="^(start_order|search_client)$"),
+                back_main_handler,
             ],
             SELECT_CATEGORY: [
                 CallbackQueryHandler(category_handler, pattern="^(cat_|show_cart|back_to_client)"),
+                back_main_handler,
             ],
             SELECT_PRODUCT: [
                 CallbackQueryHandler(product_handler, pattern="^(prod_|back_categories)"),
+                back_main_handler,
             ],
             SELECT_VARIANT: [
                 CallbackQueryHandler(variant_handler, pattern="^(var_|back_products)"),
+                back_main_handler,
             ],
             SELECT_QUANTITY: [
                 CallbackQueryHandler(quantity_handler, pattern="^(qty_|back_variants)"),
+                back_main_handler,
             ],
             CART: [
                 CallbackQueryHandler(cart_handler, pattern="^(add_more|checkout|clear_cart)$"),
+                back_main_handler,
             ],
             SELECT_ADDRESS: [
                 CallbackQueryHandler(address_handler, pattern="^(addr_|back_cart)"),
+                back_main_handler,
             ],
             ENTER_ADDRESS: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, enter_address),
             ],
             CONFIRM_ORDER: [
                 CallbackQueryHandler(confirm_handler, pattern="^(place_order|edit_order|cancel_order)$"),
-                CallbackQueryHandler(main_menu_handler, pattern="^(new_order|back_main)$"),
+                CallbackQueryHandler(main_menu_handler, pattern="^new_order$"),
+                back_main_handler,
+            ],
+            # New client states
+            NEW_CLIENT_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, new_client_name),
+            ],
+            NEW_CLIENT_CONTACT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, new_client_contact),
+            ],
+            NEW_CLIENT_PHONE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, new_client_phone),
+            ],
+            NEW_CLIENT_EMAIL: [
+                CallbackQueryHandler(new_client_email_skip, pattern="^skip_email$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, new_client_email_text),
+            ],
+            NEW_CLIENT_PRICE_GROUP: [
+                CallbackQueryHandler(new_client_price_group, pattern="^pg_"),
+            ],
+            NEW_CLIENT_ADDRESS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, new_client_address),
+            ],
+            NEW_CLIENT_CONFIRM: [
+                CallbackQueryHandler(new_client_confirm, pattern="^(save_client|redo_client|back_main)$"),
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
