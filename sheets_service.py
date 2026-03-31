@@ -92,6 +92,42 @@ def get_client_by_telegram_id(telegram_id: int) -> Optional[dict]:
     return None
 
 
+def get_next_client_id() -> str:
+    """Generate next client ID like C042."""
+    try:
+        sheet = _get_sheet()
+        ws = sheet.worksheet("Клиенты")
+        records = ws.get_all_records()
+        max_num = 0
+        for row in records:
+            cid = str(row.get("client_id", ""))
+            if cid.startswith("C"):
+                try:
+                    num = int(cid[1:])
+                    max_num = max(max_num, num)
+                except ValueError:
+                    pass
+        return f"C{max_num + 1:03d}"
+    except Exception as e:
+        logger.error(f"Error generating client ID: {e}")
+        return f"C{datetime.now().strftime('%H%M%S')}"
+
+
+def create_client(client_data: dict) -> Optional[dict]:
+    """Add a new client row to the Клиенты sheet. Returns the created client dict."""
+    try:
+        sheet = _get_sheet()
+        ws = sheet.worksheet("Клиенты")
+        headers = ws.row_values(1)
+        row = [str(client_data.get(h, "")) for h in headers]
+        ws.append_row(row, value_input_option="USER_ENTERED")
+        logger.info(f"Client created: {client_data.get('client_id')} — {client_data.get('name')}")
+        return client_data
+    except Exception as e:
+        logger.error(f"Error creating client: {e}")
+        return None
+
+
 def update_client_after_order(client_id: str, order_summary: str, telegram_id: int = None):
     """Update last_order_date, usual_order, and optionally telegram_id."""
     try:
@@ -204,3 +240,4 @@ def get_next_order_id() -> str:
     except Exception as e:
         logger.error(f"Error generating order ID: {e}")
         return f"ORD-{datetime.now().year}-0001"
+
