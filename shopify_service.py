@@ -131,6 +131,7 @@ async def create_draft_order(
     shipping_address: dict,
     note: str = "",
     tags: list[str] | None = None,
+    email: str = "",
 ) -> dict:
     """Create a Shopify draft order. Returns dict with id, name, invoiceUrl, totalPrice or error."""
 
@@ -139,16 +140,14 @@ async def create_draft_order(
         li = {
             "title": item.get("title", "Product"),
             "quantity": item["quantity"],
-            "priceOverride": {
-                "amount": str(item.get("custom_price", "0.00")),
-                "currencyCode": "EUR",
-            },
+            "originalUnitPrice": float(item.get("custom_price", 0)),
         }
         shopify_line_items.append(li)
 
     input_data = {
         "lineItems": shopify_line_items,
         "shippingAddress": shipping_address,
+        "billingAddress": shipping_address,
         "note": note,
         "tags": tags or ["telegram-bot"],
         "shippingLine": {
@@ -158,6 +157,8 @@ async def create_draft_order(
     }
     if customer_id:
         input_data["customerId"] = customer_id
+    if email:
+        input_data["email"] = email
 
     try:
         data = await _graphql(DRAFT_ORDER_CREATE, {"input": input_data})
