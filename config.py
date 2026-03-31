@@ -11,4 +11,4 @@ SHOPIFY_STORE = os.getenv("SHOPIFY_STORE")
 SHOPIFY_CLIENT_ID = os.getenv("SHOPIFY_CLIENT_ID")
 SHOPIFY_CLIENT_SECRET = os.getenv("SHOPIFY_CLIENT_SECRET")
 
-SHOPIFY_GRAPHQL_URL = f"https://{SHOPIFY_STORE}/admin/api/2025-01/graphql.json"
+SHOPIFY_GRAPHQL_URL = f"https://{SHOPIFY_STORE}/admin/api/2026-01/graphql.json"
