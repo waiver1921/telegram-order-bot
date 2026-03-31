@@ -59,12 +59,21 @@ async def create_draft_order(
     """
     shopify_line_items = []
     for item in line_items:
-        li = {
-            "variantId": item["variant_id"],
-            "quantity": item["quantity"],
-        }
-        if item.get("applied_discount"):
-            li["appliedDiscount"] = item["applied_discount"]
+        if item.get("variant_id") and item["variant_id"].startswith("gid://"):
+            # Variant-based line item
+            li = {
+                "variantId": item["variant_id"],
+                "quantity": item["quantity"],
+            }
+            if item.get("applied_discount"):
+                li["appliedDiscount"] = item["applied_discount"]
+        else:
+            # Custom line item (no variant in Shopify)
+            li = {
+                "title": item.get("title", "Product"),
+                "quantity": item["quantity"],
+                "originalUnitPrice": str(item.get("custom_price", "0.00")),
+            }
         shopify_line_items.append(li)
 
     input_data = {
