@@ -719,28 +719,14 @@ async def _create_order(query, context) -> int:
     rep = context.user_data.get("rep", {})
     rep_name = rep.get("name", "?")
 
-    # Build Shopify line items
+    # Build Shopify line items — always custom line items with explicit price
     line_items = []
     for item in cart:
-        variant_id = item.get("shopify_variant_id", "")
-        if variant_id and variant_id.startswith("gid://"):
-            li = {
-                "variant_id": variant_id,
-                "quantity": item["quantity"],
-                "applied_discount": {
-                    "title": "Custom price",
-                    "value": str(item["price"]),
-                    "valueType": "FIXED_AMOUNT",
-                    "description": f"Set by {rep_name}",
-                },
-                "custom_price": item["price"],
-            }
-        else:
-            li = {
-                "title": item.get("display_name", "Product"),
-                "quantity": item["quantity"],
-                "custom_price": item["price"],
-            }
+        li = {
+            "title": item.get("display_name", "Product"),
+            "quantity": item["quantity"],
+            "custom_price": item["price"],
+        }
         line_items.append(li)
 
     # Build shipping address — use structured data directly
@@ -755,10 +741,12 @@ async def _create_order(query, context) -> int:
         "city": addr_data.get("city", "Berlin"),
         "zip": addr_data.get("zip", ""),
         "countryCode": addr_data.get("countryCode", "DE"),
+        "phone": str(client.get("phone", "")),
     }
 
     customer_id = client.get("shopify_customer_id", "")
-    note = f"Sales rep: {rep_name} | Telegram bot order"
+    client_email = str(client.get("email", ""))
+    note = f"Sales rep: {rep_name} | Telegram bot order | Client: {client.get('name', '')}"
 
     result = await shopify.create_draft_order(
         customer_id=customer_id or None,
@@ -766,6 +754,7 @@ async def _create_order(query, context) -> int:
         shipping_address=shipping_address,
         note=note,
         tags=["telegram-bot"],
+        email=client_email,
     )
 
     shopify_ok = not result.get("error")
