@@ -133,6 +133,7 @@ async def create_draft_order(
     note: str = "",
     tags: list[str] | None = None,
     email: str = "",
+    custom_attributes: list[dict] | None = None,
 ) -> dict:
     """Create a Shopify draft order. Returns dict with id, name, invoiceUrl, totalPrice or error."""
 
@@ -160,6 +161,8 @@ async def create_draft_order(
         input_data["customerId"] = customer_id
     if email:
         input_data["email"] = email
+    if custom_attributes:
+        input_data["customAttributes"] = custom_attributes
 
     try:
         data = await _graphql(DRAFT_ORDER_CREATE, {"input": input_data})
