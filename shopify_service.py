@@ -129,6 +129,7 @@ async def create_draft_order(
     customer_id: str | None,
     line_items: list[dict],
     shipping_address: dict,
+    billing_address: dict = None,
     note: str = "",
     tags: list[str] | None = None,
     email: str = "",
@@ -147,7 +148,7 @@ async def create_draft_order(
     input_data = {
         "lineItems": shopify_line_items,
         "shippingAddress": shipping_address,
-        "billingAddress": shipping_address,
+        "billingAddress": billing_address or shipping_address,
         "note": note,
         "tags": tags or ["telegram-bot"],
         "shippingLine": {
