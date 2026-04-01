@@ -1,11 +1,9 @@
 """
-Telegram Order Bot — Sales Rep Flow v2
+Telegram Order Bot — Sales Rep v3
 
-Changes from v1:
-- ↩️ Back button on EVERY step (including text input steps)
-- New client: structured address (street → PLZ → city → country)
-- After shipping address → "Invoice address same?" → if no → enter billing address
-- Billing address passed to Shopify separately
+Hardcoded product catalog tree. No Google Sheets catalog needed.
+Structured addresses for shipping & billing.
+Back button on every step.
 """
 
 import logging
@@ -13,76 +11,108 @@ from datetime import datetime
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    ConversationHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
+    Application, CommandHandler, CallbackQueryHandler,
+    ConversationHandler, MessageHandler, ContextTypes, filters,
 )
 
 from config import TELEGRAM_BOT_TOKEN
 import sheets_service as sheets
 import shopify_service as shopify
 
-logging.basicConfig(
-    format="%(asctime)s — %(name)s — %(levelname)s — %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(format="%(asctime)s — %(name)s — %(levelname)s — %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ─── States ───────────────────────────────────────────────────
 
 (
-    MAIN_MENU,
-    SEARCH_CLIENT,
-    SELECT_CLIENT,
-    CLIENT_CARD,
-    SELECT_PRODUCT,
-    ENTER_QUANTITY,
-    ENTER_PRICE,
-    CART,
-    # Shipping address
-    SELECT_ADDRESS,
-    SHIP_STREET,
-    SHIP_ZIP,
-    SHIP_CITY,
-    SHIP_COUNTRY,
-    # Invoice address
-    INVOICE_SAME,
-    BILL_STREET,
-    BILL_ZIP,
-    BILL_CITY,
-    BILL_COUNTRY,
-    # Confirm + create
+    MAIN_MENU, SEARCH_CLIENT, SELECT_CLIENT, CLIENT_CARD,
+    # Catalog navigation
+    CAT_L1, CAT_L2, CAT_L3, CAT_SIZE,
+    ENTER_QTY, ENTER_PRICE, CART,
+    # Shipping
+    SELECT_ADDRESS, SHIP_STREET, SHIP_ZIP, SHIP_CITY, SHIP_COUNTRY,
+    # Invoice
+    INVOICE_SAME, BILL_STREET, BILL_ZIP, BILL_CITY, BILL_COUNTRY,
     CONFIRM_ORDER,
     # New client
-    NC_NAME,
-    NC_CONTACT,
-    NC_PHONE,
-    NC_EMAIL,
-    NC_ADDR_STREET,
-    NC_ADDR_ZIP,
-    NC_ADDR_CITY,
-    NC_ADDR_COUNTRY,
-    NC_CONFIRM,
-) = range(28)
+    NC_NAME, NC_CONTACT, NC_PHONE, NC_EMAIL, NC_TAXID,
+    NC_STREET, NC_ZIP, NC_CITY, NC_COUNTRY, NC_CONFIRM,
+) = range(31)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  PRODUCT CATALOG (hardcoded tree)
+# ═══════════════════════════════════════════════════════════════
+
+CAVIAR_SIZES = ["30g", "50g", "125g", "250g", "500g", "1kg"]
+SMALL_SIZES = ["57g"]
+RED_SIZES = ["100g", "190g"]
+
+# Level 1 → Level 2 → Level 3 → sizes
+CATALOG = {
+    "Siberian Oscietra": {
+        "Classic Siberian Osc": CAVIAR_SIZES,
+        "Royal Siberian Osc": CAVIAR_SIZES,
+        "_other": {
+            "Dry": SMALL_SIZES,
+            "Pasteurisiert": SMALL_SIZES,
+        },
+    },
+    "Russian Oscietra": {
+        "Classic Russian Osc": CAVIAR_SIZES,
+        "Royal Russian Osc": CAVIAR_SIZES,
+        "_other": {
+            "Dry": SMALL_SIZES,
+            "Pasteurisiert": SMALL_SIZES,
+        },
+    },
+    "Beluga": {
+        "Classic Beluga": CAVIAR_SIZES,
+        "Royal Beluga": CAVIAR_SIZES,
+        "_other": {
+            "Dry": SMALL_SIZES,
+            "Pasteurisiert": SMALL_SIZES,
+        },
+    },
+    "Другое": {
+        "Другая икра": {
+            "Чёрная": {
+                "Amur": CAVIAR_SIZES,
+                "Kaluga": CAVIAR_SIZES,
+            },
+            "Красная": {
+                "Лосось": RED_SIZES,
+                "Кета": RED_SIZES,
+                "Форель": RED_SIZES,
+            },
+        },
+        "Рыба": {
+            "Лосось": "_no_size",
+            "Боттарга": {
+                "Обычная": "_no_size",
+                "В воске": "_no_size",
+                "В пчелином воске": "_no_size",
+            },
+            "Осетровое филе": "_no_size",
+        },
+        "Аксессуары": {
+            "Открывашка": "_no_size",
+            "Ложка большая": "_no_size",
+            "Ложка рыба": "_no_size",
+            "Обычная ложка": "_no_size",
+        },
+    },
+}
 
 
 # ─── Helpers ──────────────────────────────────────────────────
 
-
 def kb(buttons):
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(t, callback_data=d) for t, d in row] for row in buttons]
-    )
-
+        [[InlineKeyboardButton(t, callback_data=d) for t, d in row] for row in buttons])
 
 def back_btn(cb="back_main"):
-    """Single back button row."""
     return [("↩️ Назад", cb)]
-
 
 def format_cart(cart):
     if not cart:
@@ -92,92 +122,82 @@ def format_cart(cart):
     for i, item in enumerate(cart, 1):
         sub = item["price"] * item["quantity"]
         total += sub
-        lines.append(f"{i}. {item['display_name']} × {item['quantity']} — €{sub:.2f} (€{item['price']:.2f}/шт)")
+        name = item["name"]
+        if item.get("size"):
+            name += f" {item['size']}"
+        lines.append(f"{i}. {name} × {item['quantity']} — €{sub:.2f} (€{item['price']:.2f}/шт)")
     lines.append(f"\n💰 Итого: €{total:.2f}")
     return "\n".join(lines)
-
 
 def cart_total(cart):
     return sum(i["price"] * i["quantity"] for i in cart)
 
-
-def order_items_summary(cart):
-    return ", ".join(f"{i['display_name']} x{i['quantity']} @€{i['price']:.2f}" for i in cart)
-
+def order_summary(cart):
+    parts = []
+    for i in cart:
+        n = i["name"]
+        if i.get("size"):
+            n += f" {i['size']}"
+        parts.append(f"{n} x{i['quantity']} @€{i['price']:.2f}")
+    return ", ".join(parts)
 
 def fmt_addr(a):
-    """Format address dict for display."""
+    if not a:
+        return "—"
     return f"{a.get('street','')}, {a.get('zip','')} {a.get('city','')}, {a.get('country','DE')}"
 
 
 # ─── Universal back handler ──────────────────────────────────
 
-
 async def go_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Universal callback handler for all back_* buttons."""
     q = update.callback_query
     await q.answer()
-    target = q.data
-
-    if target == "back_main":
-        return await _main_menu(q, context)
-    if target == "back_search":
-        k = kb([[("🔍 Поиск клиента", "search_client")], [("➕ Новый клиент", "new_client")], back_btn()])
-        await q.edit_message_text("Для кого заказ?", reply_markup=k)
+    t = q.data
+    if t == "back_main": return await _main_menu(q, context)
+    if t == "back_search":
+        await q.edit_message_text("Для кого заказ?", reply_markup=kb([
+            [("🔍 Поиск", "search_client")], [("➕ Новый клиент", "new_client")], back_btn()]))
         return SEARCH_CLIENT
-    if target == "back_client":
-        return await _client_card(q, context)
-    if target == "back_products":
-        return await _products(q, context)
-    if target == "back_cart":
-        return await _cart(q, context)
-    if target == "back_addr":
-        return await _addr_select(q, context)
-    if target == "back_invoice_q":
-        return await _invoice_question(q, context)
-
+    if t == "back_client": return await _client_card(q, context)
+    if t == "back_cat_l1": return await _show_l1(q, context)
+    if t == "back_cat_l2":
+        return await _show_l2(q, context, context.user_data.get("cat_l1", ""))
+    if t == "back_cat_l3":
+        return await _show_l3(q, context, context.user_data.get("cat_l1",""), context.user_data.get("cat_l2",""))
+    if t == "back_products": return await _show_l1(q, context)
+    if t == "back_cart": return await _cart(q, context)
+    if t == "back_addr": return await _addr_select(q, context)
+    if t == "back_invoice_q": return await _invoice_q(q, context)
     return await _main_menu(q, context)
 
 
-# ─── /start ───────────────────────────────────────────────────
-
+# ─── /start & main menu ──────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    tg_id = update.effective_user.id
-    rep = sheets.get_sales_rep(tg_id)
+    rep = sheets.get_sales_rep(update.effective_user.id)
     if not rep:
-        await update.message.reply_text(
-            f"⛔ Доступ запрещён.\nВаш ID: `{tg_id}`", parse_mode="Markdown")
+        await update.message.reply_text(f"⛔ Доступ запрещён.\nID: `{update.effective_user.id}`", parse_mode="Markdown")
         return ConversationHandler.END
     context.user_data.update({"rep": rep, "cart": [], "client": None})
-    name = rep.get("name", "менеджер")
-    await update.message.reply_text(f"Привет, {name}!", reply_markup=kb([[("🆕 Новый заказ", "new_order")]]))
+    await update.message.reply_text(f"Привет, {rep.get('name','менеджер')}!",
+                                     reply_markup=kb([[("🆕 Новый заказ", "new_order")]]))
     return MAIN_MENU
-
 
 async def _main_menu(q, ctx):
-    n = ctx.user_data.get("rep", {}).get("name", "менеджер")
-    await q.edit_message_text(f"{n}, что делаем?", reply_markup=kb([[("🆕 Новый заказ", "new_order")]]))
+    await q.edit_message_text(f"{ctx.user_data.get('rep',{}).get('name','')}, что делаем?",
+                              reply_markup=kb([[("🆕 Новый заказ", "new_order")]]))
     return MAIN_MENU
 
-
-# ─── Main Menu ────────────────────────────────────────────────
-
-
 async def main_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
+    q = update.callback_query; await q.answer()
     if q.data == "new_order":
         context.user_data.update({"cart": [], "client": None, "shipping": None, "billing": None})
         await q.edit_message_text("Для кого заказ?", reply_markup=kb([
-            [("🔍 Поиск клиента", "search_client")],
-            [("➕ Новый клиент", "new_client")],
-        ]))
+            [("🔍 Поиск", "search_client")], [("➕ Новый клиент", "new_client")]]))
         return SEARCH_CLIENT
     if q.data == "copy_invoice":
         url = context.user_data.get("last_invoice_url", "")
-        await q.message.reply_text(f"🔗 {url}" if url else "Ссылка недоступна.")
-        return MAIN_MENU
+        await q.message.reply_text(f"🔗 {url}" if url else "Нет ссылки.")
     return MAIN_MENU
 
 
@@ -185,508 +205,553 @@ async def main_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 #  CLIENT SEARCH
 # ═══════════════════════════════════════════════════════════════
 
-
 async def search_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
-    await q.edit_message_text("🔍 Введите имя, телефон или компанию:\n", reply_markup=kb([back_btn()]))
+    q = update.callback_query; await q.answer()
+    await q.edit_message_text("🔍 Введите имя, телефон или компанию:", reply_markup=kb([back_btn()]))
     return SELECT_CLIENT
 
-
 async def search_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    txt = update.message.text.strip()
-    results = sheets.search_clients(txt)
+    results = sheets.search_clients(update.message.text.strip())
     if not results:
-        await update.message.reply_text("Ничего не найдено.", reply_markup=kb([
-            [("🔍 Искать снова", "search_client")], [("➕ Новый клиент", "new_client")], back_btn()]))
+        await update.message.reply_text("Не найдено.", reply_markup=kb([
+            [("🔍 Снова", "search_client")], [("➕ Новый", "new_client")], back_btn()]))
         return SEARCH_CLIENT
     context.user_data["search_results"] = results
-    btns = []
-    for i, c in enumerate(results[:10]):
-        lbl = c.get("name", "?")
-        a = c.get("address_1", "")
-        if a:
-            lbl += f" — {a[:25]}"
-        btns.append([(lbl, f"pick_{i}")])
-    btns += [[("🔍 Ещё раз", "search_client"), ("➕ Новый", "new_client")], back_btn()]
+    btns = [[(c.get("name","?") + (f" — {c.get('address_1','')[:20]}" if c.get("address_1") else ""),
+              f"pick_{i}")] for i, c in enumerate(results[:10])]
+    btns += [[("🔍 Снова", "search_client"), ("➕ Новый", "new_client")], back_btn()]
     await update.message.reply_text(f"Найдено ({len(results)}):", reply_markup=kb(btns))
     return SELECT_CLIENT
 
-
 async def pick_client(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
+    q = update.callback_query; await q.answer()
     if q.data == "search_client":
-        await q.edit_message_text("🔍 Введите имя, телефон или компанию:", reply_markup=kb([back_btn()]))
+        await q.edit_message_text("🔍 Введите имя:", reply_markup=kb([back_btn()]))
         return SELECT_CLIENT
     if q.data == "new_client":
         context.user_data["nc"] = {}
-        await q.edit_message_text("➕ Название компании / имя клиента:", reply_markup=kb([back_btn("back_search")]))
+        await q.edit_message_text("➕ Компания:", reply_markup=kb([back_btn("back_search")]))
         return NC_NAME
     idx = int(q.data.replace("pick_", ""))
-    res = context.user_data.get("search_results", [])
-    if idx >= len(res):
-        await q.edit_message_text("Ошибка.")
-        return SEARCH_CLIENT
-    context.user_data["client"] = res[idx]
+    context.user_data["client"] = context.user_data["search_results"][idx]
     return await _client_card(q, context)
-
 
 async def _client_card(q, ctx):
     c = ctx.user_data["client"]
-    txt = (f"🏢 {c.get('name','—')}\n👤 {c.get('contact_person','—')}\n"
-           f"📞 {c.get('phone','—')}\n📧 {c.get('email','—')}\n📍 {c.get('address_1','—')}")
+    txt = f"🏢 {c.get('name','—')}\n👤 {c.get('contact_person','—')}\n📞 {c.get('phone','—')}\n📧 {c.get('email','—')}\n📍 {c.get('address_1','—')}"
     await q.edit_message_text(txt, reply_markup=kb([
-        [("🆕 Собрать заказ", "start_order")],
-        [("🔍 Другой клиент", "search_client")],
-        back_btn()]))
+        [("🆕 Собрать заказ", "start_order")], [("🔍 Другой", "search_client")], back_btn()]))
     return CLIENT_CARD
 
-
 async def client_card_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
+    q = update.callback_query; await q.answer()
     if q.data == "start_order":
         context.user_data["cart"] = []
-        return await _products(q, context)
+        return await _show_l1(q, context)
     if q.data == "search_client":
-        await q.edit_message_text("🔍 Введите имя, телефон или компанию:", reply_markup=kb([back_btn()]))
+        await q.edit_message_text("🔍 Введите имя:", reply_markup=kb([back_btn()]))
         return SELECT_CLIENT
     return CLIENT_CARD
 
 
 # ═══════════════════════════════════════════════════════════════
-#  NEW CLIENT (with structured address)
+#  NEW CLIENT
 # ═══════════════════════════════════════════════════════════════
 
-
 async def nc_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
+    q = update.callback_query; await q.answer()
     context.user_data["nc"] = {}
-    await q.edit_message_text("➕ Название компании / имя клиента:", reply_markup=kb([back_btn("back_search")]))
+    await q.edit_message_text("➕ Компания / имя клиента:", reply_markup=kb([back_btn("back_search")]))
     return NC_NAME
 
-
-async def nc_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["nc"]["name"] = update.message.text.strip()
+async def nc_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data["nc"]["name"] = update.message.text.strip()
     await update.message.reply_text("👤 Контактное лицо:", reply_markup=kb([back_btn("back_search")]))
     return NC_CONTACT
 
-
-async def nc_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["nc"]["contact_person"] = update.message.text.strip()
+async def nc_contact(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data["nc"]["contact_person"] = update.message.text.strip()
     await update.message.reply_text("📞 Телефон:", reply_markup=kb([back_btn("back_search")]))
     return NC_PHONE
 
-
-async def nc_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["nc"]["phone"] = update.message.text.strip()
-    await update.message.reply_text("📧 Email:", reply_markup=kb([[("⏩ Пропустить", "skip_email")], back_btn("back_search")]))
+async def nc_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data["nc"]["phone"] = update.message.text.strip()
+    await update.message.reply_text("📧 Email:", reply_markup=kb([[("⏩ Пропустить","skip_email")], back_btn("back_search")]))
     return NC_EMAIL
 
+async def nc_email_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data["nc"]["email"] = update.message.text.strip()
+    await update.message.reply_text("🏛 USt-IdNr (Tax ID):", reply_markup=kb([[("⏩ Пропустить","skip_taxid")], back_btn("back_search")]))
+    return NC_TAXID
 
-async def nc_email_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["nc"]["email"] = update.message.text.strip()
+async def nc_email_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query; await q.answer()
+    ctx.user_data["nc"]["email"] = ""
+    await q.edit_message_text("🏛 USt-IdNr (Tax ID):", reply_markup=kb([[("⏩ Пропустить","skip_taxid")], back_btn("back_search")]))
+    return NC_TAXID
+
+async def nc_taxid_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data["nc"]["tax_id"] = update.message.text.strip()
     await update.message.reply_text("📍 Улица и номер дома:", reply_markup=kb([back_btn("back_search")]))
-    return NC_ADDR_STREET
+    return NC_STREET
 
-
-async def nc_email_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
-    context.user_data["nc"]["email"] = ""
+async def nc_taxid_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query; await q.answer()
+    ctx.user_data["nc"]["tax_id"] = ""
     await q.edit_message_text("📍 Улица и номер дома:", reply_markup=kb([back_btn("back_search")]))
-    return NC_ADDR_STREET
+    return NC_STREET
 
+async def nc_street(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data["nc"]["street"] = update.message.text.strip()
+    await update.message.reply_text("📮 PLZ:", reply_markup=kb([back_btn("back_search")]))
+    return NC_ZIP
 
-async def nc_addr_street(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["nc"]["street"] = update.message.text.strip()
-    await update.message.reply_text("📮 Почтовый индекс (PLZ):", reply_markup=kb([back_btn("back_search")]))
-    return NC_ADDR_ZIP
-
-
-async def nc_addr_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["nc"]["zip"] = update.message.text.strip()
+async def nc_zip(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data["nc"]["zip"] = update.message.text.strip()
     await update.message.reply_text("🏙 Город:", reply_markup=kb([
-        [("Berlin", "nccity_Berlin")], [("✏️ Другой", "nccity_other")], back_btn("back_search")]))
-    return NC_ADDR_CITY
+        [("Berlin","nccity_Berlin")],[("✏️ Другой","nccity_other")], back_btn("back_search")]))
+    return NC_CITY
 
-
-async def nc_addr_city_btn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
+async def nc_city_btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query; await q.answer()
     if q.data == "nccity_other":
-        await q.edit_message_text("🏙 Введите город:", reply_markup=kb([back_btn("back_search")]))
-        return NC_ADDR_CITY
-    context.user_data["nc"]["city"] = q.data.replace("nccity_", "")
+        await q.edit_message_text("🏙 Город:", reply_markup=kb([back_btn("back_search")]))
+        return NC_CITY
+    ctx.user_data["nc"]["city"] = q.data.replace("nccity_","")
     await q.edit_message_text("🌍 Страна:", reply_markup=kb([
-        [("🇩🇪 DE", "nccountry_DE")], [("🇦🇹 AT", "nccountry_AT"), ("🇨🇭 CH", "nccountry_CH")],
-        [("✏️ Другая", "nccountry_other")], back_btn("back_search")]))
-    return NC_ADDR_COUNTRY
+        [("🇩🇪 DE","ncc_DE")],[("🇦🇹 AT","ncc_AT"),("🇨🇭 CH","ncc_CH")],[("✏️ Другая","ncc_other")], back_btn("back_search")]))
+    return NC_COUNTRY
 
-
-async def nc_addr_city_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["nc"]["city"] = update.message.text.strip()
+async def nc_city_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data["nc"]["city"] = update.message.text.strip()
     await update.message.reply_text("🌍 Страна:", reply_markup=kb([
-        [("🇩🇪 DE", "nccountry_DE")], [("🇦🇹 AT", "nccountry_AT"), ("🇨🇭 CH", "nccountry_CH")],
-        [("✏️ Другая", "nccountry_other")], back_btn("back_search")]))
-    return NC_ADDR_COUNTRY
+        [("🇩🇪 DE","ncc_DE")],[("🇦🇹 AT","ncc_AT"),("🇨🇭 CH","ncc_CH")],[("✏️ Другая","ncc_other")], back_btn("back_search")]))
+    return NC_COUNTRY
 
+async def nc_country_btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query; await q.answer()
+    if q.data == "ncc_other":
+        await q.edit_message_text("🌍 Код страны (DE,AT,CH…):", reply_markup=kb([back_btn("back_search")]))
+        return NC_COUNTRY
+    ctx.user_data["nc"]["country"] = q.data.replace("ncc_","")
+    return await _nc_confirm_show(q, ctx, True)
 
-async def nc_addr_country_btn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
-    if q.data == "nccountry_other":
-        await q.edit_message_text("🌍 Код страны (2 буквы: DE, AT, CH…):", reply_markup=kb([back_btn("back_search")]))
-        return NC_ADDR_COUNTRY
-    context.user_data["nc"]["country"] = q.data.replace("nccountry_", "")
-    return await _nc_show_confirm(q, context, is_cb=True)
+async def nc_country_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data["nc"]["country"] = update.message.text.strip().upper()[:2]
+    return await _nc_confirm_show(update, ctx, False)
 
-
-async def nc_addr_country_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["nc"]["country"] = update.message.text.strip().upper()[:2]
-    return await _nc_show_confirm(update, context, is_cb=False)
-
-
-async def _nc_show_confirm(src, ctx, is_cb):
+async def _nc_confirm_show(src, ctx, is_cb):
     nc = ctx.user_data["nc"]
-    addr = f"{nc.get('street','')}, {nc.get('zip','')} {nc.get('city','')}, {nc.get('country','DE')}"
-    txt = (f"📋 Новый клиент:\n\n🏢 {nc.get('name')}\n👤 {nc.get('contact_person')}\n"
-           f"📞 {nc.get('phone')}\n📧 {nc.get('email') or '—'}\n📍 {addr}\n\nВсё верно?")
-    btns = kb([[("✅ Сохранить", "save_client")], [("✏️ Заново", "redo_client")], back_btn()])
-    if is_cb:
-        await src.edit_message_text(txt, reply_markup=btns)
-    else:
-        await src.message.reply_text(txt, reply_markup=btns)
+    a = f"{nc.get('street','')}, {nc.get('zip','')} {nc.get('city','')}, {nc.get('country','DE')}"
+    tax = nc.get('tax_id','')
+    txt = (f"📋 Новый клиент:\n🏢 {nc.get('name')}\n👤 {nc.get('contact_person')}\n"
+           f"📞 {nc.get('phone')}\n📧 {nc.get('email') or '—'}\n🏛 USt-IdNr: {tax or '—'}\n📍 {a}\n\nВерно?")
+    btns = kb([[("✅ Сохранить","save_client")],[("✏️ Заново","redo_client")],back_btn()])
+    if is_cb: await src.edit_message_text(txt, reply_markup=btns)
+    else: await src.message.reply_text(txt, reply_markup=btns)
     return NC_CONFIRM
 
-
-async def nc_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
+async def nc_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query; await q.answer()
     if q.data == "redo_client":
-        context.user_data["nc"] = {}
-        await q.edit_message_text("➕ Название компании:", reply_markup=kb([back_btn("back_search")]))
+        ctx.user_data["nc"] = {}
+        await q.edit_message_text("➕ Компания:", reply_markup=kb([back_btn("back_search")]))
         return NC_NAME
     if q.data == "save_client":
-        nc = context.user_data["nc"]
+        nc = ctx.user_data["nc"]
         cid = sheets.get_next_client_id()
-        addr_str = f"{nc.get('street','')}, {nc.get('zip','')} {nc.get('city','')}, {nc.get('country','DE')}"
-        data = {
-            "client_id": cid, "name": nc.get("name",""), "contact_person": nc.get("contact_person",""),
-            "phone": nc.get("phone",""), "email": nc.get("email",""), "telegram_id": "",
-            "address_1": addr_str, "address_2": "", "address_label_1": "", "address_label_2": "",
-            "notes": "", "shopify_customer_id": "", "usual_order": "", "last_order_date": "",
-        }
-        result = sheets.create_client(data)
-        if result:
-            # Also store structured address for later use
-            data["_addr_structured"] = {
-                "street": nc.get("street",""), "zip": nc.get("zip",""),
-                "city": nc.get("city",""), "country": nc.get("country","DE"),
-            }
-            context.user_data["client"] = data
+        addr = f"{nc.get('street','')}, {nc.get('zip','')} {nc.get('city','')}, {nc.get('country','DE')}"
+        data = {"client_id": cid, "name": nc.get("name",""), "contact_person": nc.get("contact_person",""),
+                "phone": nc.get("phone",""), "email": nc.get("email",""), "telegram_id": "",
+                "tax_id": nc.get("tax_id",""),
+                "address_1": addr, "address_2":"","address_label_1":"","address_label_2":"",
+                "notes":"","shopify_customer_id":"","usual_order":"","last_order_date":""}
+        if sheets.create_client(data):
+            ctx.user_data["client"] = data
             await q.edit_message_text(f"✅ Клиент «{nc.get('name')}» создан!", reply_markup=kb([
-                [("🆕 Собрать заказ", "start_order")], back_btn()]))
+                [("🆕 Собрать заказ","start_order")], back_btn()]))
             return CLIENT_CARD
-        await q.edit_message_text("❌ Ошибка сохранения.")
-        return MAIN_MENU
+        await q.edit_message_text("❌ Ошибка.")
     return NC_CONFIRM
 
 
 # ═══════════════════════════════════════════════════════════════
-#  CATALOG → QUANTITY → PRICE → CART
+#  CATALOG NAVIGATION
 # ═══════════════════════════════════════════════════════════════
 
-
-async def _products(q, ctx):
-    cat = sheets.get_catalog()
-    if not cat:
-        await q.edit_message_text("Каталог пуст.")
-        return MAIN_MENU
-    btns = [[(it.get("display_name", it.get("name","?")), f"prod_{it.get('product_id')}")] for it in cat]
+async def _show_l1(q, ctx):
+    """Level 1: main categories."""
     cart = ctx.user_data.get("cart", [])
+    btns = [[(name, f"l1_{name}")] for name in CATALOG.keys()]
     if cart:
         btns.append([("🛒 Корзина ({})".format(len(cart)), "show_cart")])
     btns.append(back_btn("back_client"))
-    await q.edit_message_text("Выберите товар:", reply_markup=kb(btns))
-    return SELECT_PRODUCT
+    await q.edit_message_text("Выберите:", reply_markup=kb(btns))
+    return CAT_L1
+
+async def cat_l1_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query; await q.answer()
+    if q.data == "show_cart": return await _cart(q, ctx)
+    name = q.data.replace("l1_", "")
+    ctx.user_data["cat_l1"] = name
+    return await _show_l2(q, ctx, name)
+
+async def _show_l2(q, ctx, l1):
+    """Level 2: sub-categories."""
+    node = CATALOG.get(l1, {})
+    btns = []
+    for key in node:
+        if key == "_other":
+            btns.append([("Другое", "l2__other")])
+        else:
+            btns.append([(key, f"l2_{key}")])
+    btns.append(back_btn("back_cat_l1"))
+    await q.edit_message_text(f"📦 {l1}:", reply_markup=kb(btns))
+    return CAT_L2
+
+async def cat_l2_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query; await q.answer()
+    name = q.data.replace("l2_", "")
+    ctx.user_data["cat_l2"] = name
+    l1 = ctx.user_data["cat_l1"]
+    node = CATALOG[l1]
+
+    if name == "_other":
+        sub = node.get("_other", {})
+    else:
+        sub = node.get(name)
+
+    if sub is None:
+        return CAT_L2
+
+    # If sub is a list of sizes → go to size selection
+    if isinstance(sub, list):
+        ctx.user_data["cat_path"] = f"{l1} → {name}"
+        return await _show_sizes(q, ctx, sub)
+
+    # If sub is "_no_size" → skip size, go to qty
+    if sub == "_no_size":
+        ctx.user_data["cat_path"] = f"{l1} → {name}"
+        ctx.user_data["cur_size"] = ""
+        await q.edit_message_text(f"📦 {name}\n\nКоличество?", reply_markup=kb([back_btn("back_cat_l2")]))
+        return ENTER_QTY
+
+    # Otherwise it's a dict → go deeper (L3)
+    return await _show_l3(q, ctx, l1, name)
+
+async def _show_l3(q, ctx, l1, l2):
+    """Level 3: deeper sub-categories."""
+    node = CATALOG[l1]
+    if l2 == "_other":
+        sub = node.get("_other", {})
+    else:
+        sub = node.get(l2, {})
+
+    btns = []
+    for key in sub:
+        btns.append([(key, f"l3_{key}")])
+    btns.append(back_btn("back_cat_l2"))
+    label = "Другое" if l2 == "_other" else l2
+    await q.edit_message_text(f"📦 {l1} → {label}:", reply_markup=kb(btns))
+    return CAT_L3
+
+async def cat_l3_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query; await q.answer()
+    name = q.data.replace("l3_", "")
+    ctx.user_data["cat_l3"] = name
+    l1 = ctx.user_data["cat_l1"]
+    l2 = ctx.user_data["cat_l2"]
+
+    node = CATALOG[l1]
+    if l2 == "_other":
+        sub = node.get("_other", {}).get(name)
+    else:
+        sub = node.get(l2, {}).get(name)
+
+    if sub is None:
+        return CAT_L3
+
+    if isinstance(sub, list):
+        ctx.user_data["cat_path"] = f"{l1} → {l2} → {name}" if l2 != "_other" else f"{l1} → {name}"
+        return await _show_sizes(q, ctx, sub)
+
+    if sub == "_no_size":
+        ctx.user_data["cat_path"] = f"{l1} → {l2} → {name}" if l2 != "_other" else f"{l1} → {name}"
+        ctx.user_data["cur_size"] = ""
+        await q.edit_message_text(f"📦 {name}\n\nКоличество?", reply_markup=kb([back_btn("back_cat_l3")]))
+        return ENTER_QTY
+
+    # Even deeper (e.g. Другая икра → Чёрная → Amur)
+    # Store and show next level
+    ctx.user_data["cat_l3_sub"] = name
+    btns = []
+    for key in sub:
+        btns.append([(key, f"l4_{key}")])
+    btns.append(back_btn("back_cat_l3"))
+    await q.edit_message_text(f"📦 {name}:", reply_markup=kb(btns))
+    return CAT_SIZE  # reuse state for L4 selections
+
+async def cat_l4_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle level 4+ selections (deepest items)."""
+    q = update.callback_query; await q.answer()
+    name = q.data.replace("l4_", "")
+    l1 = ctx.user_data["cat_l1"]
+    l2 = ctx.user_data["cat_l2"]
+    l3 = ctx.user_data["cat_l3"]
+    l3_sub = ctx.user_data.get("cat_l3_sub", "")
+
+    # Navigate to the value
+    node = CATALOG[l1]
+    if l2 == "_other":
+        branch = node.get("_other", {}).get(l3, {})
+    else:
+        branch = node.get(l2, {}).get(l3, {})
+
+    if l3_sub and isinstance(branch, dict):
+        branch = branch.get(l3_sub, {})
+
+    val = branch.get(name) if isinstance(branch, dict) else branch
+
+    path = f"{l3_sub} → {name}" if l3_sub else f"{l3} → {name}"
+    ctx.user_data["cat_path"] = path
+
+    if isinstance(val, list):
+        return await _show_sizes(q, ctx, val)
+    if val == "_no_size":
+        ctx.user_data["cur_size"] = ""
+        await q.edit_message_text(f"📦 {name}\n\nКоличество?", reply_markup=kb([back_btn("back_cat_l3")]))
+        return ENTER_QTY
+
+    # It's another dict → show its keys as sizes or items
+    if isinstance(val, dict):
+        btns = [[(k, f"l4_{k}")] for k in val]
+        btns.append(back_btn("back_cat_l3"))
+        await q.edit_message_text(f"📦 {name}:", reply_markup=kb(btns))
+        return CAT_SIZE
+
+    return CAT_SIZE
 
 
-async def product_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
-    if q.data == "show_cart":
-        return await _cart(q, context)
-    pid = q.data.replace("prod_", "")
-    cat = sheets.get_catalog()
-    prod = next((x for x in cat if str(x.get("product_id")) == pid), None)
-    if not prod:
-        await q.edit_message_text("Не найден.")
-        return SELECT_PRODUCT
-    context.user_data["cur_prod"] = prod
-    name = prod.get("display_name", prod.get("name", "?"))
-    await q.edit_message_text(f"📦 {name}\n\nСколько штук? (введите число)",
-                              reply_markup=kb([back_btn("back_products")]))
-    return ENTER_QUANTITY
+async def _show_sizes(q, ctx, sizes):
+    path = ctx.user_data.get("cat_path", "")
+    btns = [[(s, f"size_{s}")] for s in sizes]
+    btns.append(back_btn("back_cat_l2"))
+    await q.edit_message_text(f"📦 {path}\n\nРазмер:", reply_markup=kb(btns))
+    return CAT_SIZE
+
+async def size_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query; await q.answer()
+    size = q.data.replace("size_", "")
+    ctx.user_data["cur_size"] = size
+    path = ctx.user_data.get("cat_path", "")
+    await q.edit_message_text(f"📦 {path} {size}\n\nКоличество?", reply_markup=kb([back_btn("back_cat_l2")]))
+    return ENTER_QTY
 
 
-async def enter_qty(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+# ─── Quantity & Price ─────────────────────────────────────────
+
+async def enter_qty(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     txt = update.message.text.strip()
     try:
-        qty = int(txt)
-        assert qty > 0
-    except (ValueError, AssertionError):
-        await update.message.reply_text("❌ Введите число > 0:", reply_markup=kb([back_btn("back_products")]))
-        return ENTER_QUANTITY
-    context.user_data["cur_qty"] = qty
-    p = context.user_data["cur_prod"]
-    await update.message.reply_text(
-        f"📦 {p.get('display_name','?')} × {qty}\n\n💶 Цена за штуку (€)?",
-        reply_markup=kb([back_btn("back_products")]))
+        qty = int(txt); assert qty > 0
+    except:
+        await update.message.reply_text("❌ Число > 0:", reply_markup=kb([back_btn("back_cat_l1")]))
+        return ENTER_QTY
+    ctx.user_data["cur_qty"] = qty
+    path = ctx.user_data.get("cat_path", "")
+    size = ctx.user_data.get("cur_size", "")
+    label = f"{path} {size}".strip()
+    await update.message.reply_text(f"📦 {label} × {qty}\n\n💶 Цена за штуку (€)?", reply_markup=kb([back_btn("back_cat_l1")]))
     return ENTER_PRICE
 
-
-async def enter_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    txt = update.message.text.strip().replace(",", ".")
+async def enter_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    txt = update.message.text.strip().replace(",",".")
     try:
-        price = float(txt)
-        assert price > 0
-    except (ValueError, AssertionError):
-        await update.message.reply_text("❌ Введите цену:", reply_markup=kb([back_btn("back_products")]))
+        price = float(txt); assert price > 0
+    except:
+        await update.message.reply_text("❌ Цена:", reply_markup=kb([back_btn("back_cat_l1")]))
         return ENTER_PRICE
-    p = context.user_data["cur_prod"]
-    context.user_data.setdefault("cart", []).append({
-        "product_id": p.get("product_id"),
-        "display_name": p.get("display_name", p.get("name", "?")),
-        "shopify_variant_id": p.get("shopify_variant_id", ""),
-        "price": price, "quantity": context.user_data["cur_qty"],
+    path = ctx.user_data.get("cat_path", "")
+    size = ctx.user_data.get("cur_size", "")
+    ctx.user_data.setdefault("cart", []).append({
+        "name": path, "size": size, "display_name": f"{path} {size}".strip(),
+        "price": price, "quantity": ctx.user_data["cur_qty"],
     })
-    # Show cart as new message (after text input)
-    cart = context.user_data["cart"]
-    await update.message.reply_text("🛒 Корзина:\n\n" + format_cart(cart), reply_markup=kb([
-        [("➕ Добавить ещё", "add_more")],
-        [("🗑 Удалить последний", "remove_last")],
-        [("✅ Оформить", "checkout")],
-        [("❌ Очистить", "clear_cart")],
-    ]))
+    cart = ctx.user_data["cart"]
+    btns = [[("➕ Добавить ещё","add_more")]]
+    if cart: btns.append([("🗑 Удалить последний","remove_last")])
+    btns += [[("✅ Оформить","checkout")],[("❌ Очистить","clear_cart")]]
+    await update.message.reply_text("🛒 Корзина:\n\n" + format_cart(cart), reply_markup=kb(btns))
     return CART
 
 
 # ─── Cart ─────────────────────────────────────────────────────
 
-
 async def _cart(q, ctx):
     cart = ctx.user_data.get("cart", [])
-    btns = [[("➕ Добавить ещё", "add_more")]]
-    if cart:
-        btns.append([("🗑 Удалить последний", "remove_last")])
-    btns += [[("✅ Оформить", "checkout")], [("❌ Очистить", "clear_cart")], back_btn("back_products")]
+    btns = [[("➕ Добавить","add_more")]]
+    if cart: btns.append([("🗑 Удалить последний","remove_last")])
+    btns += [[("✅ Оформить","checkout")],[("❌ Очистить","clear_cart")],back_btn("back_cat_l1")]
     await q.edit_message_text("🛒 Корзина:\n\n" + format_cart(cart), reply_markup=kb(btns))
     return CART
 
-
-async def cart_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
-    if q.data == "add_more":
-        return await _products(q, context)
+async def cart_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query; await q.answer()
+    if q.data == "add_more": return await _show_l1(q, ctx)
     if q.data == "remove_last":
-        cart = context.user_data.get("cart", [])
-        if cart:
-            cart.pop()
-        return await _cart(q, context)
+        cart = ctx.user_data.get("cart",[])
+        if cart: cart.pop()
+        return await _cart(q, ctx)
     if q.data == "clear_cart":
-        context.user_data["cart"] = []
-        return await _cart(q, context)
+        ctx.user_data["cart"] = []
+        return await _cart(q, ctx)
     if q.data == "checkout":
-        if not context.user_data.get("cart"):
-            return await _products(q, context)
-        return await _addr_select(q, context)
+        if not ctx.user_data.get("cart"): return await _show_l1(q, ctx)
+        return await _addr_select(q, ctx)
     return CART
 
 
 # ═══════════════════════════════════════════════════════════════
-#  SHIPPING ADDRESS (step-by-step)
+#  SHIPPING ADDRESS
 # ═══════════════════════════════════════════════════════════════
 
-
 async def _addr_select(q, ctx):
-    c = ctx.user_data.get("client", {})
+    c = ctx.user_data.get("client",{})
     btns = []
-    a1 = c.get("address_1", "")
-    if a1:
-        btns.append([(f"📍 {a1[:40]}", "addr_saved_1")])
-    a2 = c.get("address_2", "")
-    if a2:
-        btns.append([(f"📍 {a2[:40]}", "addr_saved_2")])
-    btns += [[("✏️ Новый адрес", "addr_new")], back_btn("back_cart")]
+    if c.get("address_1"): btns.append([(f"📍 {c['address_1'][:40]}","addr_s1")])
+    if c.get("address_2"): btns.append([(f"📍 {c['address_2'][:40]}","addr_s2")])
+    btns += [[("✏️ Новый адрес","addr_new")], back_btn("back_cart")]
     await q.edit_message_text("📍 Адрес доставки:", reply_markup=kb(btns))
     return SELECT_ADDRESS
 
-
-async def addr_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
-    c = context.user_data.get("client", {})
-    if q.data == "addr_saved_1":
-        context.user_data["shipping"] = {"street": c.get("address_1",""), "zip": "", "city": "Berlin", "country": "DE"}
-        return await _invoice_question(q, context)
-    if q.data == "addr_saved_2":
-        context.user_data["shipping"] = {"street": c.get("address_2",""), "zip": "", "city": "Berlin", "country": "DE"}
-        return await _invoice_question(q, context)
+async def addr_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query; await q.answer()
+    c = ctx.user_data.get("client",{})
+    if q.data == "addr_s1":
+        ctx.user_data["shipping"] = {"street": c.get("address_1",""), "zip":"", "city":"Berlin", "country":"DE"}
+        return await _invoice_q(q, ctx)
+    if q.data == "addr_s2":
+        ctx.user_data["shipping"] = {"street": c.get("address_2",""), "zip":"", "city":"Berlin", "country":"DE"}
+        return await _invoice_q(q, ctx)
     if q.data == "addr_new":
-        context.user_data["_addr_target"] = "shipping"
-        await q.edit_message_text("📍 Улица и номер дома:", reply_markup=kb([back_btn("back_addr")]))
+        ctx.user_data["_sh"] = {}
+        await q.edit_message_text("📍 Улица:", reply_markup=kb([back_btn("back_addr")]))
         return SHIP_STREET
     return SELECT_ADDRESS
 
-
-async def ship_street(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.setdefault("_ship_tmp", {})["street"] = update.message.text.strip()
+async def sh_street(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data.setdefault("_sh",{})["street"] = update.message.text.strip()
     await update.message.reply_text("📮 PLZ:", reply_markup=kb([back_btn("back_addr")]))
     return SHIP_ZIP
 
-
-async def ship_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["_ship_tmp"]["zip"] = update.message.text.strip()
+async def sh_zip(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data["_sh"]["zip"] = update.message.text.strip()
     await update.message.reply_text("🏙 Город:", reply_markup=kb([
-        [("Berlin", "shipcity_Berlin")], [("✏️ Другой", "shipcity_other")], back_btn("back_addr")]))
+        [("Berlin","shcity_Berlin")],[("✏️ Другой","shcity_other")],back_btn("back_addr")]))
     return SHIP_CITY
 
-
-async def ship_city_btn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
-    if q.data == "shipcity_other":
+async def sh_city_btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query; await q.answer()
+    if q.data == "shcity_other":
         await q.edit_message_text("🏙 Город:", reply_markup=kb([back_btn("back_addr")]))
         return SHIP_CITY
-    context.user_data["_ship_tmp"]["city"] = q.data.replace("shipcity_", "")
+    ctx.user_data["_sh"]["city"] = q.data.replace("shcity_","")
     await q.edit_message_text("🌍 Страна:", reply_markup=kb([
-        [("🇩🇪 DE", "shipcountry_DE")], [("🇦🇹 AT", "shipcountry_AT"), ("🇨🇭 CH", "shipcountry_CH")],
-        [("✏️ Другая", "shipcountry_other")], back_btn("back_addr")]))
+        [("🇩🇪 DE","shc_DE")],[("🇦🇹 AT","shc_AT"),("🇨🇭 CH","shc_CH")],[("✏️","shc_other")],back_btn("back_addr")]))
     return SHIP_COUNTRY
 
-
-async def ship_city_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["_ship_tmp"]["city"] = update.message.text.strip()
+async def sh_city_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data["_sh"]["city"] = update.message.text.strip()
     await update.message.reply_text("🌍 Страна:", reply_markup=kb([
-        [("🇩🇪 DE", "shipcountry_DE")], [("🇦🇹 AT", "shipcountry_AT"), ("🇨🇭 CH", "shipcountry_CH")],
-        [("✏️ Другая", "shipcountry_other")], back_btn("back_addr")]))
+        [("🇩🇪 DE","shc_DE")],[("🇦🇹 AT","shc_AT"),("🇨🇭 CH","shc_CH")],[("✏️","shc_other")],back_btn("back_addr")]))
     return SHIP_COUNTRY
 
-
-async def ship_country_btn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
-    if q.data == "shipcountry_other":
-        await q.edit_message_text("🌍 Код страны (DE, AT, CH…):", reply_markup=kb([back_btn("back_addr")]))
+async def sh_country_btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query; await q.answer()
+    if q.data == "shc_other":
+        await q.edit_message_text("🌍 Код (DE,AT…):", reply_markup=kb([back_btn("back_addr")]))
         return SHIP_COUNTRY
-    context.user_data["_ship_tmp"]["country"] = q.data.replace("shipcountry_", "")
-    context.user_data["shipping"] = dict(context.user_data["_ship_tmp"])
-    return await _invoice_question(q, context)
+    ctx.user_data["_sh"]["country"] = q.data.replace("shc_","")
+    ctx.user_data["shipping"] = dict(ctx.user_data["_sh"])
+    return await _invoice_q(q, ctx)
 
-
-async def ship_country_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["_ship_tmp"]["country"] = update.message.text.strip().upper()[:2]
-    context.user_data["shipping"] = dict(context.user_data["_ship_tmp"])
-    # Need to show invoice question as new msg
-    ship = context.user_data["shipping"]
+async def sh_country_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data["_sh"]["country"] = update.message.text.strip().upper()[:2]
+    ctx.user_data["shipping"] = dict(ctx.user_data["_sh"])
+    ship = ctx.user_data["shipping"]
     await update.message.reply_text(
-        f"📍 Доставка: {fmt_addr(ship)}\n\n🧾 Адрес для счёта (Rechnungsadresse) такой же?",
-        reply_markup=kb([[("✅ Да, такой же", "invoice_same")], [("✏️ Нет, другой", "invoice_diff")], back_btn("back_addr")]))
+        f"📍 Доставка: {fmt_addr(ship)}\n\n🧾 Rechnungsadresse такой же?",
+        reply_markup=kb([[("✅ Да","invoice_same")],[("✏️ Нет","invoice_diff")],back_btn("back_addr")]))
     return INVOICE_SAME
 
 
 # ═══════════════════════════════════════════════════════════════
-#  INVOICE ADDRESS QUESTION
+#  INVOICE ADDRESS
 # ═══════════════════════════════════════════════════════════════
 
-
-async def _invoice_question(q, ctx):
-    ship = ctx.user_data.get("shipping", {})
+async def _invoice_q(q, ctx):
+    ship = ctx.user_data.get("shipping",{})
     await q.edit_message_text(
-        f"📍 Доставка: {fmt_addr(ship)}\n\n🧾 Адрес для счёта (Rechnungsadresse) такой же?",
-        reply_markup=kb([[("✅ Да, такой же", "invoice_same")], [("✏️ Нет, другой", "invoice_diff")], back_btn("back_addr")]))
+        f"📍 Доставка: {fmt_addr(ship)}\n\n🧾 Rechnungsadresse такой же?",
+        reply_markup=kb([[("✅ Да","invoice_same")],[("✏️ Нет","invoice_diff")],back_btn("back_addr")]))
     return INVOICE_SAME
 
-
-async def invoice_same_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
+async def invoice_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query; await q.answer()
     if q.data == "invoice_same":
-        context.user_data["billing"] = dict(context.user_data.get("shipping", {}))
-        return await _confirm(q, context)
+        ctx.user_data["billing"] = dict(ctx.user_data.get("shipping",{}))
+        return await _confirm(q, ctx)
     if q.data == "invoice_diff":
-        context.user_data["_bill_tmp"] = {}
-        await q.edit_message_text("🧾 Улица и номер дома (для счёта):", reply_markup=kb([back_btn("back_invoice_q")]))
+        ctx.user_data["_bl"] = {}
+        await q.edit_message_text("🧾 Улица (счёт):", reply_markup=kb([back_btn("back_invoice_q")]))
         return BILL_STREET
     return INVOICE_SAME
 
-
-# ─── Billing address steps ────────────────────────────────────
-
-
-async def bill_street(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.setdefault("_bill_tmp", {})["street"] = update.message.text.strip()
+async def bl_street(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data.setdefault("_bl",{})["street"] = update.message.text.strip()
     await update.message.reply_text("📮 PLZ (счёт):", reply_markup=kb([back_btn("back_invoice_q")]))
     return BILL_ZIP
 
-
-async def bill_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["_bill_tmp"]["zip"] = update.message.text.strip()
+async def bl_zip(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data["_bl"]["zip"] = update.message.text.strip()
     await update.message.reply_text("🏙 Город (счёт):", reply_markup=kb([
-        [("Berlin", "billcity_Berlin")], [("✏️ Другой", "billcity_other")], back_btn("back_invoice_q")]))
+        [("Berlin","blcity_Berlin")],[("✏️","blcity_other")],back_btn("back_invoice_q")]))
     return BILL_CITY
 
-
-async def bill_city_btn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
-    if q.data == "billcity_other":
+async def bl_city_btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query; await q.answer()
+    if q.data == "blcity_other":
         await q.edit_message_text("🏙 Город (счёт):", reply_markup=kb([back_btn("back_invoice_q")]))
         return BILL_CITY
-    context.user_data["_bill_tmp"]["city"] = q.data.replace("billcity_", "")
+    ctx.user_data["_bl"]["city"] = q.data.replace("blcity_","")
     await q.edit_message_text("🌍 Страна (счёт):", reply_markup=kb([
-        [("🇩🇪 DE", "billcountry_DE")], [("🇦🇹 AT", "billcountry_AT"), ("🇨🇭 CH", "billcountry_CH")],
-        [("✏️ Другая", "billcountry_other")], back_btn("back_invoice_q")]))
+        [("🇩🇪 DE","blc_DE")],[("🇦🇹 AT","blc_AT"),("🇨🇭 CH","blc_CH")],[("✏️","blc_other")],back_btn("back_invoice_q")]))
     return BILL_COUNTRY
 
-
-async def bill_city_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["_bill_tmp"]["city"] = update.message.text.strip()
+async def bl_city_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data["_bl"]["city"] = update.message.text.strip()
     await update.message.reply_text("🌍 Страна (счёт):", reply_markup=kb([
-        [("🇩🇪 DE", "billcountry_DE")], [("🇦🇹 AT", "billcountry_AT"), ("🇨🇭 CH", "billcountry_CH")],
-        [("✏️ Другая", "billcountry_other")], back_btn("back_invoice_q")]))
+        [("🇩🇪 DE","blc_DE")],[("🇦🇹 AT","blc_AT"),("🇨🇭 CH","blc_CH")],[("✏️","blc_other")],back_btn("back_invoice_q")]))
     return BILL_COUNTRY
 
-
-async def bill_country_btn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
-    if q.data == "billcountry_other":
-        await q.edit_message_text("🌍 Код страны (счёт):", reply_markup=kb([back_btn("back_invoice_q")]))
+async def bl_country_btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query; await q.answer()
+    if q.data == "blc_other":
+        await q.edit_message_text("🌍 Код:", reply_markup=kb([back_btn("back_invoice_q")]))
         return BILL_COUNTRY
-    context.user_data["_bill_tmp"]["country"] = q.data.replace("billcountry_", "")
-    context.user_data["billing"] = dict(context.user_data["_bill_tmp"])
-    return await _confirm(q, context)
+    ctx.user_data["_bl"]["country"] = q.data.replace("blc_","")
+    ctx.user_data["billing"] = dict(ctx.user_data["_bl"])
+    return await _confirm(q, ctx)
 
-
-async def bill_country_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["_bill_tmp"]["country"] = update.message.text.strip().upper()[:2]
-    context.user_data["billing"] = dict(context.user_data["_bill_tmp"])
-    # Show confirmation as new message
-    cart = context.user_data.get("cart", [])
-    client = context.user_data.get("client", {})
-    ship = context.user_data.get("shipping", {})
-    bill = context.user_data.get("billing", {})
-    txt = _confirm_text(client, cart, ship, bill)
-    await update.message.reply_text(txt, reply_markup=kb([
-        [("✅ Создать заказ", "place_order")],
-        [("✏️ Редактировать", "edit_order")],
-        [("❌ Отменить", "cancel_order")],
-    ]))
+async def bl_country_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data["_bl"]["country"] = update.message.text.strip().upper()[:2]
+    ctx.user_data["billing"] = dict(ctx.user_data["_bl"])
+    cart = ctx.user_data.get("cart",[])
+    client = ctx.user_data.get("client",{})
+    ship = ctx.user_data.get("shipping",{})
+    bill = ctx.user_data["billing"]
+    await update.message.reply_text(_confirm_text(client,cart,ship,bill), reply_markup=kb([
+        [("✅ Создать","place_order")],[("✏️ Редактировать","edit_order")],[("❌ Отмена","cancel_order")]]))
     return CONFIRM_ORDER
 
 
@@ -694,251 +759,176 @@ async def bill_country_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 #  CONFIRMATION
 # ═══════════════════════════════════════════════════════════════
 
-
 def _confirm_text(client, cart, ship, bill):
-    name = client.get("name", "—")
-    lines = [f"📦 Заказ для {name}:\n"]
+    lines = [f"📦 Заказ для {client.get('name','—')}:\n"]
     total = 0.0
     for i, item in enumerate(cart, 1):
         sub = item["price"] * item["quantity"]
         total += sub
-        lines.append(f"{i}. {item['display_name']} × {item['quantity']} — €{sub:.2f}")
+        n = item["name"]
+        if item.get("size"): n += f" {item['size']}"
+        lines.append(f"{i}. {n} × {item['quantity']} — €{sub:.2f}")
     lines.append(f"\n📍 Доставка: {fmt_addr(ship)}")
     if ship != bill:
         lines.append(f"🧾 Счёт: {fmt_addr(bill)}")
     lines.append(f"💰 Итого: €{total:.2f}")
     return "\n".join(lines)
 
-
 async def _confirm(q, ctx):
-    cart = ctx.user_data.get("cart", [])
-    client = ctx.user_data.get("client", {})
-    ship = ctx.user_data.get("shipping", {})
-    bill = ctx.user_data.get("billing", {})
-    txt = _confirm_text(client, cart, ship, bill)
-    await q.edit_message_text(txt, reply_markup=kb([
-        [("✅ Создать заказ", "place_order")],
-        [("✏️ Редактировать", "edit_order")],
-        [("❌ Отменить", "cancel_order")],
-    ]))
+    cart = ctx.user_data.get("cart",[]); client = ctx.user_data.get("client",{})
+    ship = ctx.user_data.get("shipping",{}); bill = ctx.user_data.get("billing",{})
+    await q.edit_message_text(_confirm_text(client,cart,ship,bill), reply_markup=kb([
+        [("✅ Создать","place_order")],[("✏️ Редактировать","edit_order")],[("❌ Отмена","cancel_order")]]))
     return CONFIRM_ORDER
 
-
-async def confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
-    if q.data == "edit_order":
-        return await _cart(q, context)
+async def confirm_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query; await q.answer()
+    if q.data == "edit_order": return await _cart(q, ctx)
     if q.data == "cancel_order":
-        context.user_data["cart"] = []
+        ctx.user_data["cart"] = []
         await q.edit_message_text("❌ Отменён.")
-        return await _main_menu(q, context)
+        return await _main_menu(q, ctx)
     if q.data == "place_order":
-        await q.edit_message_text("⏳ Создаю заказ...")
-        return await _create_order(q, context)
+        await q.edit_message_text("⏳ Создаю…")
+        return await _create_order(q, ctx)
     return CONFIRM_ORDER
 
 
 # ═══════════════════════════════════════════════════════════════
-#  CREATE ORDER → SHOPIFY + SHEETS
+#  CREATE ORDER
 # ═══════════════════════════════════════════════════════════════
 
-
-def _to_shopify_addr(addr_dict, client):
-    contact = client.get("contact_person", "")
-    parts = contact.split(" ", 1) if contact else ["", ""]
+def _shopify_addr(a, client):
+    contact = client.get("contact_person","")
+    parts = contact.split(" ",1) if contact else ["",""]
     return {
-        "firstName": parts[0] if parts else "",
-        "lastName": parts[1] if len(parts) > 1 else "",
-        "company": client.get("name", ""),
-        "address1": addr_dict.get("street", ""),
-        "city": addr_dict.get("city", "Berlin"),
-        "zip": addr_dict.get("zip", ""),
-        "countryCode": addr_dict.get("country", "DE"),
-        "phone": str(client.get("phone", "")),
+        "firstName": parts[0], "lastName": parts[1] if len(parts)>1 else "",
+        "company": client.get("name",""),
+        "address1": a.get("street",""), "city": a.get("city","Berlin"),
+        "zip": a.get("zip",""), "countryCode": a.get("country","DE"),
+        "phone": str(client.get("phone","")),
     }
 
-
 async def _create_order(q, ctx):
-    cart = ctx.user_data.get("cart", [])
-    client = ctx.user_data.get("client", {})
-    ship = ctx.user_data.get("shipping", {})
-    bill = ctx.user_data.get("billing", {})
-    rep = ctx.user_data.get("rep", {})
-    rep_name = rep.get("name", "?")
+    cart = ctx.user_data.get("cart",[]); client = ctx.user_data.get("client",{})
+    ship = ctx.user_data.get("shipping",{}); bill = ctx.user_data.get("billing",{})
+    rep = ctx.user_data.get("rep",{}); rep_name = rep.get("name","?")
 
-    line_items = [{"title": i["display_name"], "quantity": i["quantity"], "custom_price": i["price"]} for i in cart]
+    items = [{"title": f"{i['name']} {i.get('size','')}".strip(), "quantity": i["quantity"], "custom_price": i["price"]} for i in cart]
 
-    shipping_address = _to_shopify_addr(ship, client)
-    billing_address = _to_shopify_addr(bill, client)
+    tax_id = str(client.get("tax_id", ""))
+    note_parts = [f"Sales rep: {rep_name}", client.get("name","")]
+    if tax_id:
+        note_parts.append(f"USt-IdNr: {tax_id}")
+
+    custom_attributes = []
+    if tax_id:
+        custom_attributes.append({"key": "USt-IdNr", "value": tax_id})
 
     result = await shopify.create_draft_order(
         customer_id=client.get("shopify_customer_id") or None,
-        line_items=line_items,
-        shipping_address=shipping_address,
-        billing_address=billing_address,
-        note=f"Sales rep: {rep_name} | {client.get('name','')}",
+        line_items=items,
+        shipping_address=_shopify_addr(ship, client),
+        billing_address=_shopify_addr(bill, client),
+        note=" | ".join(note_parts),
         tags=["telegram-bot"],
-        email=str(client.get("email", "")),
+        email=str(client.get("email","")),
+        custom_attributes=custom_attributes,
     )
 
     ok = not result.get("error")
     oid = sheets.get_next_order_id()
     sheets.save_order({
-        "order_id": oid,
-        "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "client_id": client.get("client_id", ""),
-        "client_name": client.get("name", ""),
-        "items": order_items_summary(cart),
-        "total": f"{cart_total(cart):.2f}",
-        "address": fmt_addr(ship),
-        "sales_rep": rep_name,
-        "shopify_draft_id": result.get("id", "") if ok else "",
-        "shopify_invoice_url": result.get("invoiceUrl", "") if ok else "",
+        "order_id": oid, "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "client_id": client.get("client_id",""), "client_name": client.get("name",""),
+        "items": order_summary(cart), "total": f"{cart_total(cart):.2f}",
+        "address": fmt_addr(ship), "sales_rep": rep_name,
+        "shopify_draft_id": result.get("id","") if ok else "",
+        "shopify_invoice_url": result.get("invoiceUrl","") if ok else "",
         "status": "draft" if ok else "saved",
     })
-    sheets.update_client_after_order(client.get("client_id", ""), order_items_summary(cart))
+    sheets.update_client_after_order(client.get("client_id",""), order_summary(cart))
 
     if ok:
-        ctx.user_data["last_invoice_url"] = result.get("invoiceUrl", "")
+        ctx.user_data["last_invoice_url"] = result.get("invoiceUrl","")
         btns = []
-        if result.get("invoiceUrl"):
-            btns.append([("🔗 Ссылка на оплату", "copy_invoice")])
-        btns += [[("🆕 Новый заказ", "new_order")], back_btn()]
-        await q.edit_message_text(
-            f"✅ Заказ создан!\n📋 {result.get('name','')}\n📦 {oid}\n💰 €{cart_total(cart):.2f}",
-            reply_markup=kb(btns))
+        if result.get("invoiceUrl"): btns.append([("🔗 Invoice link","copy_invoice")])
+        btns += [[("🆕 Новый заказ","new_order")],back_btn()]
+        await q.edit_message_text(f"✅ Заказ создан!\n📋 {result.get('name','')}\n📦 {oid}\n💰 €{cart_total(cart):.2f}",
+                                  reply_markup=kb(btns))
     else:
-        await q.edit_message_text(
-            f"✅ Сохранён в таблицу\n📦 {oid}\n💰 €{cart_total(cart):.2f}\n⚠️ Shopify: {result.get('error','')}",
-            reply_markup=kb([[("🆕 Новый заказ", "new_order")], back_btn()]))
+        await q.edit_message_text(f"✅ Сохранён\n📦 {oid}\n💰 €{cart_total(cart):.2f}\n⚠️ {result.get('error','')}",
+                                  reply_markup=kb([[("🆕 Новый","new_order")],back_btn()]))
     return MAIN_MENU
 
 
-# ─── Cancel ───────────────────────────────────────────────────
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("/start чтобы начать заново.")
+async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("/start")
     return ConversationHandler.END
 
 
 # ═══════════════════════════════════════════════════════════════
-#  CONVERSATION HANDLER
+#  WIRING
 # ═══════════════════════════════════════════════════════════════
-
 
 def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
-    back_h = CallbackQueryHandler(go_back, pattern="^back_")
+    bh = CallbackQueryHandler(go_back, pattern="^back_")
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            MAIN_MENU: [
-                CallbackQueryHandler(main_menu_cb, pattern="^(new_order|copy_invoice)$"),
-                back_h,
-            ],
-            SEARCH_CLIENT: [
-                CallbackQueryHandler(search_start, pattern="^search_client$"),
-                CallbackQueryHandler(nc_start, pattern="^new_client$"),
-                back_h,
-                MessageHandler(filters.TEXT & ~filters.COMMAND, search_input),
-            ],
-            SELECT_CLIENT: [
-                CallbackQueryHandler(pick_client, pattern="^(pick_\\d+|search_client|new_client)$"),
-                back_h,
-                MessageHandler(filters.TEXT & ~filters.COMMAND, search_input),
-            ],
-            CLIENT_CARD: [
-                CallbackQueryHandler(client_card_cb, pattern="^(start_order|search_client)$"),
-                back_h,
-            ],
-            SELECT_PRODUCT: [
-                CallbackQueryHandler(product_cb, pattern="^(prod_|show_cart)"),
-                back_h,
-            ],
-            ENTER_QUANTITY: [
-                back_h,
-                MessageHandler(filters.TEXT & ~filters.COMMAND, enter_qty),
-            ],
-            ENTER_PRICE: [
-                back_h,
-                MessageHandler(filters.TEXT & ~filters.COMMAND, enter_price),
-            ],
-            CART: [
-                CallbackQueryHandler(cart_cb, pattern="^(add_more|remove_last|checkout|clear_cart)$"),
-                back_h,
-            ],
-            SELECT_ADDRESS: [
-                CallbackQueryHandler(addr_cb, pattern="^addr_"),
-                back_h,
-            ],
-            SHIP_STREET: [back_h, MessageHandler(filters.TEXT & ~filters.COMMAND, ship_street)],
-            SHIP_ZIP: [back_h, MessageHandler(filters.TEXT & ~filters.COMMAND, ship_zip)],
-            SHIP_CITY: [
-                CallbackQueryHandler(ship_city_btn, pattern="^shipcity_"),
-                back_h,
-                MessageHandler(filters.TEXT & ~filters.COMMAND, ship_city_text),
-            ],
-            SHIP_COUNTRY: [
-                CallbackQueryHandler(ship_country_btn, pattern="^shipcountry_"),
-                back_h,
-                MessageHandler(filters.TEXT & ~filters.COMMAND, ship_country_text),
-            ],
-            INVOICE_SAME: [
-                CallbackQueryHandler(invoice_same_cb, pattern="^invoice_"),
-                back_h,
-            ],
-            BILL_STREET: [back_h, MessageHandler(filters.TEXT & ~filters.COMMAND, bill_street)],
-            BILL_ZIP: [back_h, MessageHandler(filters.TEXT & ~filters.COMMAND, bill_zip)],
-            BILL_CITY: [
-                CallbackQueryHandler(bill_city_btn, pattern="^billcity_"),
-                back_h,
-                MessageHandler(filters.TEXT & ~filters.COMMAND, bill_city_text),
-            ],
-            BILL_COUNTRY: [
-                CallbackQueryHandler(bill_country_btn, pattern="^billcountry_"),
-                back_h,
-                MessageHandler(filters.TEXT & ~filters.COMMAND, bill_country_text),
-            ],
-            CONFIRM_ORDER: [
-                CallbackQueryHandler(confirm_cb, pattern="^(place_order|edit_order|cancel_order)$"),
-                back_h,
-            ],
-            NC_NAME: [back_h, MessageHandler(filters.TEXT & ~filters.COMMAND, nc_name)],
-            NC_CONTACT: [back_h, MessageHandler(filters.TEXT & ~filters.COMMAND, nc_contact)],
-            NC_PHONE: [back_h, MessageHandler(filters.TEXT & ~filters.COMMAND, nc_phone)],
-            NC_EMAIL: [
-                CallbackQueryHandler(nc_email_skip, pattern="^skip_email$"),
-                back_h,
-                MessageHandler(filters.TEXT & ~filters.COMMAND, nc_email_text),
-            ],
-            NC_ADDR_STREET: [back_h, MessageHandler(filters.TEXT & ~filters.COMMAND, nc_addr_street)],
-            NC_ADDR_ZIP: [back_h, MessageHandler(filters.TEXT & ~filters.COMMAND, nc_addr_zip)],
-            NC_ADDR_CITY: [
-                CallbackQueryHandler(nc_addr_city_btn, pattern="^nccity_"),
-                back_h,
-                MessageHandler(filters.TEXT & ~filters.COMMAND, nc_addr_city_text),
-            ],
-            NC_ADDR_COUNTRY: [
-                CallbackQueryHandler(nc_addr_country_btn, pattern="^nccountry_"),
-                back_h,
-                MessageHandler(filters.TEXT & ~filters.COMMAND, nc_addr_country_text),
-            ],
-            NC_CONFIRM: [
-                CallbackQueryHandler(nc_confirm, pattern="^(save_client|redo_client)$"),
-                back_h,
-            ],
+            MAIN_MENU: [CallbackQueryHandler(main_menu_cb, pattern="^(new_order|copy_invoice)$"), bh],
+            SEARCH_CLIENT: [CallbackQueryHandler(search_start, pattern="^search_client$"),
+                            CallbackQueryHandler(nc_start, pattern="^new_client$"), bh,
+                            MessageHandler(filters.TEXT & ~filters.COMMAND, search_input)],
+            SELECT_CLIENT: [CallbackQueryHandler(pick_client, pattern="^(pick_|search_client|new_client)"),
+                            bh, MessageHandler(filters.TEXT & ~filters.COMMAND, search_input)],
+            CLIENT_CARD: [CallbackQueryHandler(client_card_cb, pattern="^(start_order|search_client)$"), bh],
+            CAT_L1: [CallbackQueryHandler(cat_l1_cb, pattern="^(l1_|show_cart)"), bh],
+            CAT_L2: [CallbackQueryHandler(cat_l2_cb, pattern="^l2_"), bh],
+            CAT_L3: [CallbackQueryHandler(cat_l3_cb, pattern="^l3_"), bh],
+            CAT_SIZE: [CallbackQueryHandler(size_cb, pattern="^size_"),
+                       CallbackQueryHandler(cat_l4_cb, pattern="^l4_"), bh],
+            ENTER_QTY: [bh, MessageHandler(filters.TEXT & ~filters.COMMAND, enter_qty)],
+            ENTER_PRICE: [bh, MessageHandler(filters.TEXT & ~filters.COMMAND, enter_price)],
+            CART: [CallbackQueryHandler(cart_cb, pattern="^(add_more|remove_last|checkout|clear_cart)$"), bh],
+            SELECT_ADDRESS: [CallbackQueryHandler(addr_cb, pattern="^addr_"), bh],
+            SHIP_STREET: [bh, MessageHandler(filters.TEXT & ~filters.COMMAND, sh_street)],
+            SHIP_ZIP: [bh, MessageHandler(filters.TEXT & ~filters.COMMAND, sh_zip)],
+            SHIP_CITY: [CallbackQueryHandler(sh_city_btn, pattern="^shcity_"), bh,
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, sh_city_text)],
+            SHIP_COUNTRY: [CallbackQueryHandler(sh_country_btn, pattern="^shc_"), bh,
+                           MessageHandler(filters.TEXT & ~filters.COMMAND, sh_country_text)],
+            INVOICE_SAME: [CallbackQueryHandler(invoice_cb, pattern="^invoice_"), bh],
+            BILL_STREET: [bh, MessageHandler(filters.TEXT & ~filters.COMMAND, bl_street)],
+            BILL_ZIP: [bh, MessageHandler(filters.TEXT & ~filters.COMMAND, bl_zip)],
+            BILL_CITY: [CallbackQueryHandler(bl_city_btn, pattern="^blcity_"), bh,
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, bl_city_text)],
+            BILL_COUNTRY: [CallbackQueryHandler(bl_country_btn, pattern="^blc_"), bh,
+                           MessageHandler(filters.TEXT & ~filters.COMMAND, bl_country_text)],
+            CONFIRM_ORDER: [CallbackQueryHandler(confirm_cb, pattern="^(place_order|edit_order|cancel_order)$"), bh],
+            NC_NAME: [bh, MessageHandler(filters.TEXT & ~filters.COMMAND, nc_name)],
+            NC_CONTACT: [bh, MessageHandler(filters.TEXT & ~filters.COMMAND, nc_contact)],
+            NC_PHONE: [bh, MessageHandler(filters.TEXT & ~filters.COMMAND, nc_phone)],
+            NC_EMAIL: [CallbackQueryHandler(nc_email_skip, pattern="^skip_email$"), bh,
+                       MessageHandler(filters.TEXT & ~filters.COMMAND, nc_email_text)],
+            NC_TAXID: [CallbackQueryHandler(nc_taxid_skip, pattern="^skip_taxid$"), bh,
+                       MessageHandler(filters.TEXT & ~filters.COMMAND, nc_taxid_text)],
+            NC_STREET: [bh, MessageHandler(filters.TEXT & ~filters.COMMAND, nc_street)],
+            NC_ZIP: [bh, MessageHandler(filters.TEXT & ~filters.COMMAND, nc_zip)],
+            NC_CITY: [CallbackQueryHandler(nc_city_btn, pattern="^nccity_"), bh,
+                      MessageHandler(filters.TEXT & ~filters.COMMAND, nc_city_text)],
+            NC_COUNTRY: [CallbackQueryHandler(nc_country_btn, pattern="^ncc_"), bh,
+                         MessageHandler(filters.TEXT & ~filters.COMMAND, nc_country_text)],
+            NC_CONFIRM: [CallbackQueryHandler(nc_confirm, pattern="^(save_client|redo_client)$"), bh],
         },
         fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
         allow_reentry=True,
     )
-
     app.add_handler(conv)
     logger.info("Bot starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
