@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
     # New client
     NC_NAME, NC_CONTACT, NC_PHONE, NC_EMAIL, NC_TAXID,
     NC_STREET, NC_ZIP, NC_CITY, NC_COUNTRY, NC_CONFIRM,
-) = range(31)
+) = range(32)
 
 
 # ═══════════════════════════════════════════════════════════════
